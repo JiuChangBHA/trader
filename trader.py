@@ -63,8 +63,15 @@ class Config:
             self.data_retention = self.config.get('data_retention_days', 30)
             self.backtest_mode = self.config.get('backtest_mode', False)
             
+            # Trading mode (paper or live)
+            self.trading_mode = self.config.get('trading_mode', 'paper')
+            
             # Backtest settings
             self.initial_equity = self.config.get('initial_equity', 100000.0)  # Default $100,000
+            
+            # Local data settings
+            self.use_local_data = self.config.get('use_local_data', False)
+            self.local_data_dir = self.config.get('local_data_dir', '')
             
         except Exception as e:
             logger.error(f"Error loading configuration: {str(e)}")
@@ -80,10 +87,18 @@ class Config:
         self.backtest_start_date = start_date
         self.backtest_end_date = end_date
         logger.info(f"Backtest date range set: {start_date} to {end_date}")
+        
+    def set_local_data_options(self, use_local_data: bool, local_data_dir: str = None):
+        """Set options for using local data files"""
+        self.use_local_data = use_local_data
+        if local_data_dir:
+            self.local_data_dir = local_data_dir
+        logger.info(f"Local data {'enabled' if use_local_data else 'disabled'}" + 
+                   (f" with directory: {local_data_dir}" if local_data_dir else ""))
 
 # Data Engine: Handles market data ingestion and processing
 class DataEngine:
-    def __init__(self, api: REST, symbols: List[str]):
+    def __init__(self, api: REST, symbols: List[str], backtest_mode: bool = False):
         self.api = api
         self.symbols = symbols
         self.bars = {symbol: pd.DataFrame() for symbol in symbols}
@@ -92,14 +107,20 @@ class DataEngine:
         self.data_queue = queue.Queue()
         self.running = False
         self.data_thread = None
+        self.backtest_mode = backtest_mode
         
     def start(self):
         """Start the data engine"""
         self.running = True
-        self.data_thread = threading.Thread(target=self._poll_data)
-        self.data_thread.daemon = True
-        self.data_thread.start()
-        logger.info("Data Engine started")
+        
+        # Skip data polling in backtest mode
+        if not self.backtest_mode:
+            self.data_thread = threading.Thread(target=self._poll_data)
+            self.data_thread.daemon = True
+            self.data_thread.start()
+            logger.info("Data Engine started with live data polling")
+        else:
+            logger.info("Data Engine started in backtest mode (no live data polling)")
         
     def stop(self):
         """Stop the data engine"""
@@ -137,9 +158,20 @@ class DataEngine:
                             if len(self.bars[symbol]) == 0:
                                 self.bars[symbol] = new_bar
                                 self.data_queue.put(('BAR', symbol, latest_bar))
-                            elif len(self.bars[symbol].index) > 0 and pd.Timestamp(latest_bar.t) > self.bars[symbol].index[-1]:
-                                self.bars[symbol] = pd.concat([self.bars[symbol], new_bar]).tail(1000)
-                                self.data_queue.put(('BAR', symbol, latest_bar))
+                            elif len(self.bars[symbol].index) > 0:
+                                # Ensure consistent timezone handling
+                                last_timestamp = self.bars[symbol].index[-1]
+                                new_timestamp = new_bar.index[0]
+                                
+                                # Make both timestamps timezone-aware for comparison
+                                if last_timestamp.tz is None and new_timestamp.tz is not None:
+                                    last_timestamp = last_timestamp.tz_localize(new_timestamp.tz)
+                                elif last_timestamp.tz is not None and new_timestamp.tz is None:
+                                    new_timestamp = new_timestamp.tz_localize(last_timestamp.tz)
+                                
+                                if new_timestamp > last_timestamp:
+                                    self.bars[symbol] = pd.concat([self.bars[symbol], new_bar]).tail(1000)
+                                    self.data_queue.put(('BAR', symbol, latest_bar))
                         
                         # Get latest quote
                         latest_quote = self.api.get_latest_quote(symbol)
@@ -357,7 +389,40 @@ class RiskManager:
                 logger.warning(f"Could not get account equity, using default: {str(e)}")
         
         logger.info(f"Risk Manager initialized with equity: ${self.current_equity:.2f}")
-        
+    
+    def get_risk_metrics(self) -> Dict[str, float]:
+        """Get risk metrics for dashboard display"""
+        try:
+            # Update account info to ensure we have the latest data
+            self.update_account_info()
+            
+            # Calculate volatility based on equity changes if we have performance tracker data
+            volatility = 0.0
+            var_95 = 0.0
+            expected_shortfall = 0.0
+            beta = 0.0
+            correlation_spy = 0.0
+            
+            # Return the metrics
+            return {
+                'max_drawdown': self.current_drawdown * 100,  # Convert to percentage
+                'volatility': volatility,
+                'var_95': var_95,
+                'expected_shortfall': expected_shortfall,
+                'beta': beta,
+                'correlation_spy': correlation_spy
+            }
+        except Exception as e:
+            logger.error(f"Error calculating risk metrics: {str(e)}")
+            return {
+                'max_drawdown': 0.0,
+                'volatility': 0.0,
+                'var_95': 0.0,
+                'expected_shortfall': 0.0,
+                'beta': 0.0,
+                'correlation_spy': 0.0
+            }
+    
     def update_account_info(self) -> None:
         """Update account equity information"""
         try:
@@ -563,6 +628,92 @@ class ExecutionEngine:
             order_info = self.orders[order_id]
             if order_info['status'] not in ['filled', 'canceled', 'expired', 'rejected']:
                 self.get_order_status(order_id)
+                
+    def get_recent_orders(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent orders for display in dashboard"""
+        try:
+            # In backtest mode, use our internal order tracking
+            if hasattr(self, 'orders') and self.orders:
+                # Convert internal order format to display format
+                recent_orders = []
+                for order_id, order_info in list(self.orders.items())[-limit:]:
+                    recent_orders.append({
+                        "symbol": order_info.get('symbol', ''),
+                        "side": order_info.get('side', ''),
+                        "qty": order_info.get('qty', 0),
+                        "type": order_info.get('type', 'market'),
+                        "status": order_info.get('status', ''),
+                        "created_at": order_info.get('submitted_at', datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                return recent_orders
+            
+            # In live mode, get from API
+            try:
+                orders = self.api.list_orders(status='all', limit=limit)
+                return [{
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "qty": order.qty,
+                    "type": order.type,
+                    "status": order.status,
+                    "created_at": order.submitted_at.strftime('%Y-%m-%d %H:%M:%S') if order.submitted_at else ''
+                } for order in orders]
+            except Exception as e:
+                logger.error(f"Error getting orders from API: {str(e)}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error getting recent orders: {str(e)}")
+            return []
+            
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Get current positions for display in dashboard"""
+        try:
+            # Check if we're in backtest mode by looking for positions attribute
+            if hasattr(self, 'positions') and isinstance(self.positions, dict):
+                # Convert internal position format to display format
+                position_list = []
+                for symbol, position_info in self.positions.items():
+                    if position_info.get('qty', 0) != 0:  # Only include non-zero positions
+                        # Calculate unrealized P&L if we have current price
+                        unrealized_pl = 0
+                        unrealized_plpc = 0
+                        avg_entry_price = position_info.get('avg_entry_price', 0)
+                        current_price = position_info.get('current_price', 0)
+                        qty = position_info.get('qty', 0)
+                        
+                        if avg_entry_price > 0 and current_price > 0 and qty != 0:
+                            unrealized_pl = (current_price - avg_entry_price) * qty
+                            unrealized_plpc = (current_price / avg_entry_price - 1) * 100
+                            
+                        position_list.append({
+                            "symbol": symbol,
+                            "qty": qty,
+                            "avg_entry_price": avg_entry_price,
+                            "current_price": current_price,
+                            "unrealized_pl": unrealized_pl,
+                            "unrealized_plpc": unrealized_plpc
+                        })
+                return position_list
+            
+            # In live mode, get from API
+            try:
+                positions = self.api.list_positions()
+                return [{
+                    "symbol": p.symbol,
+                    "qty": float(p.qty),
+                    "avg_entry_price": float(p.avg_entry_price),
+                    "current_price": float(p.current_price),
+                    "unrealized_pl": float(p.unrealized_pl),
+                    "unrealized_plpc": float(p.unrealized_plpc)
+                } for p in positions]
+            except Exception as e:
+                logger.error(f"Error getting positions from API: {str(e)}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error getting positions: {str(e)}")
+            return []
 
 # Performance Tracker: Tracks and reports on system performance
 class PerformanceTracker:
@@ -579,7 +730,7 @@ class PerformanceTracker:
         # Initialize tracking
         self.update_performance()
     
-    def update_performance(self) -> None:
+    def update_performance(self, backtest_date=None) -> None:
         """Update performance metrics"""
         try:
             # Get account info
@@ -600,9 +751,12 @@ class PerformanceTracker:
                     equity = self.initial_equity
                 logger.debug(f"Using fallback equity value: ${equity:.2f}")
                     
-            # Record equity point
+            # Record equity point with the appropriate timestamp
+            # Use backtest_date if provided and in backtest mode, otherwise use current time
+            timestamp = backtest_date if self.backtest_mode and backtest_date else datetime.now()
+            
             self.equity_curve.append({
-                'timestamp': datetime.now(),
+                'timestamp': timestamp,
                 'equity': equity
             })
             
@@ -612,7 +766,7 @@ class PerformanceTracker:
                 if prev_equity > 0:  # Avoid division by zero
                     daily_return = (equity - prev_equity) / prev_equity
                     self.daily_returns.append({
-                        'date': datetime.now().date(),
+                        'date': timestamp.date(),
                         'return': daily_return
                     })
             
@@ -736,6 +890,96 @@ class PerformanceTracker:
             report += f"- Total Trades: N/A\n"
         
         return report
+        
+    def get_portfolio_stats(self) -> Dict[str, float]:
+        """Get portfolio statistics for dashboard display"""
+        self.update_performance()
+        metrics = self.calculate_metrics()
+        
+        # Convert metrics to percentages for display
+        stats = {}
+        
+        # Total return
+        if 'total_return' in metrics and metrics['total_return'] is not None:
+            stats['total_return'] = metrics['total_return'] * 100
+        else:
+            stats['total_return'] = 0.0
+            
+        # Calculate daily, monthly, annual returns if we have equity data
+        if len(self.equity_curve) > 1:
+            # Get first and last equity points
+            first_equity = self.equity_curve[0]['equity']
+            last_equity = self.equity_curve[-1]['equity']
+            
+            # Calculate trading days
+            trading_days = (self.equity_curve[-1]['timestamp'] - self.equity_curve[0]['timestamp']).days
+            if trading_days == 0:
+                trading_days = 1  # Avoid division by zero
+                
+            # Calculate returns
+            if first_equity > 0:
+                total_return = (last_equity / first_equity) - 1
+                
+                # Annualize returns
+                daily_return = (1 + total_return) ** (1 / trading_days) - 1
+                monthly_return = (1 + daily_return) ** 21 - 1  # Approx 21 trading days in a month
+                annual_return = (1 + daily_return) ** 252 - 1  # Approx 252 trading days in a year
+                
+                stats['daily_return'] = daily_return * 100
+                stats['monthly_return'] = monthly_return * 100
+                stats['annual_return'] = annual_return * 100
+            else:
+                stats['daily_return'] = 0.0
+                stats['monthly_return'] = 0.0
+                stats['annual_return'] = 0.0
+        else:
+            stats['daily_return'] = 0.0
+            stats['monthly_return'] = 0.0
+            stats['annual_return'] = 0.0
+            
+        # Add other metrics
+        if 'sharpe_ratio' in metrics and metrics['sharpe_ratio'] is not None:
+            stats['sharpe_ratio'] = metrics['sharpe_ratio']
+        else:
+            stats['sharpe_ratio'] = 0.0
+            
+        if 'win_rate' in metrics and metrics['win_rate'] is not None:
+            stats['win_rate'] = metrics['win_rate'] * 100
+        else:
+            stats['win_rate'] = 0.0
+            
+        if 'max_drawdown' in metrics and metrics['max_drawdown'] is not None:
+            stats['max_drawdown'] = metrics['max_drawdown'] * 100
+        else:
+            stats['max_drawdown'] = 0.0
+            
+        # Add current equity
+        if self.equity_curve:
+            stats['current_equity'] = self.equity_curve[-1]['equity']
+        else:
+            stats['current_equity'] = self.initial_equity
+            
+        return stats
+        
+    def get_equity_history(self) -> pd.DataFrame:
+        """Get equity curve data for charting"""
+        if not self.equity_curve:
+            # Return empty DataFrame with expected columns
+            return pd.DataFrame(columns=['timestamp', 'equity'])
+            
+        # Convert to DataFrame
+        df = pd.DataFrame(self.equity_curve)
+        
+        return df
+    
+    def check_market_hours(self) -> bool:
+        """Check if market is open"""
+        try:
+            clock = self.api.get_clock()
+            return clock.is_open
+        except Exception as e:
+            logger.error(f"Error checking market hours: {str(e)}")
+            return False
 
 # Strategy Manager: Manages all strategies and processes signals
 class StrategyManager:
@@ -854,15 +1098,6 @@ class StrategyManager:
                     strategy.position += qty
                 else:
                     strategy.position -= qty
-    
-    def check_market_hours(self) -> bool:
-        """Check if market is open"""
-        try:
-            clock = self.api.get_clock()
-            return clock.is_open
-        except Exception as e:
-            logger.error(f"Error checking market hours: {str(e)}")
-            return False
 
 # Main Trading System class
 class AlpacaTradingSystem:
@@ -878,7 +1113,7 @@ class AlpacaTradingSystem:
         )
         
         # Create system components
-        self.data_engine = DataEngine(self.api, self.config.symbols)
+        self.data_engine = DataEngine(self.api, self.config.symbols, self.config.backtest_mode)
         self.risk_manager = RiskManager(self.api, self.config)
         self.execution_engine = ExecutionEngine(self.api)
         self.strategy_manager = StrategyManager(
@@ -895,6 +1130,51 @@ class AlpacaTradingSystem:
         self.main_thread = None
         self.start_time = None
         
+        # Log storage for dashboard
+        self.log_buffer = []
+        self.max_log_entries = 1000  # Maximum number of log entries to store
+        
+        # Set up log handler to capture logs
+        self._setup_log_capture()
+        
+    def _setup_log_capture(self):
+        """Set up log capture for dashboard display"""
+        class LogCaptureHandler(logging.Handler):
+            def __init__(self, trading_system):
+                super().__init__()
+                self.trading_system = trading_system
+                
+            def emit(self, record):
+                # Use backtest date for timestamp if in backtest mode
+                if hasattr(self.trading_system, 'config') and self.trading_system.config.backtest_mode and hasattr(self.trading_system, 'backtest_current_date'):
+                    # Use the current backtest date for the log timestamp
+                    timestamp = self.trading_system.backtest_current_date.strftime("%Y-%m-%d %H:%M:%S") if self.trading_system.backtest_current_date else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                log_entry = {
+                    "timestamp": timestamp,
+                    "level": record.levelname,
+                    "message": record.getMessage()
+                }
+                
+                # Add to log buffer, maintaining max size
+                self.trading_system.log_buffer.append(log_entry)
+                if len(self.trading_system.log_buffer) > self.trading_system.max_log_entries:
+                    self.trading_system.log_buffer.pop(0)
+        
+        # Add our custom handler to the logger
+        log_handler = LogCaptureHandler(self)
+        logger.addHandler(log_handler)
+        
+    def get_logs(self, level="all"):
+        """Get system logs filtered by level"""
+        if level.lower() == "all":
+            return self.log_buffer
+        else:
+            # Filter logs by level
+            return [log for log in self.log_buffer if log["level"].lower() == level.lower()]
+    
     def start(self):
         """Start the trading system"""
         if self.running:
@@ -931,14 +1211,20 @@ class AlpacaTradingSystem:
             self.main_thread.join(timeout=10)
         
         # Stop data engine
-        self.data_engine.stop()
+        try:
+            self.data_engine.stop()
+        except Exception as e:
+            logger.error(f"Error stopping data engine: {str(e)}")
         
         # Cancel all pending orders
-        self.execution_engine.cancel_all_orders()
+        try:
+            self.execution_engine.cancel_all_orders()
+        except Exception as e:
+            logger.error(f"Error canceling orders: {str(e)}")
         
         logger.info("Trading system stopped successfully")
         
-    def run_backtest(self, start_date: str, end_date: str):
+    def run_backtest(self, start_date: str, end_date: str, use_local_data: bool = False, local_data_dir: str = None):
         """Run system in backtest mode"""
         if self.running:
             logger.warning("Cannot start backtest while system is running")
@@ -950,8 +1236,16 @@ class AlpacaTradingSystem:
         self.config.set_backtest_mode(True)
         self.config.set_backtest_dates(start_date, end_date)
         
+        # Configure local data options if provided
+        if use_local_data:
+            self.config.set_local_data_options(True, local_data_dir)
+            logger.info(f"Using local data from: {local_data_dir}")
+        
         # Set initial equity for backtesting
         initial_equity = self.config.initial_equity if hasattr(self.config, 'initial_equity') else 100000.0
+        
+        # Reinitialize components with backtest mode
+        self.data_engine = DataEngine(self.api, self.config.symbols, backtest_mode=True)
         
         # Reinitialize the risk manager with backtest mode enabled
         self.risk_manager = RiskManager(self.api, self.config)
@@ -962,9 +1256,10 @@ class AlpacaTradingSystem:
         self.performance_tracker = PerformanceTracker(self.api, backtest_mode=True)
         self.performance_tracker.initial_equity = initial_equity
         
-        # Force update the equity curve with the initial equity
+        # Force update the equity curve with the initial equity at the backtest start date
         self.performance_tracker.equity_curve = []
-        self.performance_tracker.update_performance()
+        start_date_dt = pd.to_datetime(start_date)
+        self.performance_tracker.update_performance(backtest_date=start_date_dt)
         
         logger.info(f"Backtest initial equity: ${initial_equity:.2f}")
         
@@ -977,6 +1272,8 @@ class AlpacaTradingSystem:
         # Wait for completion
         max_wait_time = 300  # Maximum wait time in seconds (5 minutes)
         start_wait_time = time.time()
+        last_report_time = time.time()
+        report_interval = 60  # Generate report every 60 seconds
         
         while self.running:
             # Check if we've exceeded the maximum wait time
@@ -989,12 +1286,22 @@ class AlpacaTradingSystem:
             if hasattr(self, 'backtest_data_processed') and self.backtest_data_processed:
                 logger.info("Backtest data processing complete")
                 break
+            
+            # Periodically generate report during backtest
+            current_time = time.time()
+            if current_time - last_report_time > report_interval:
+                # Generate interim report
+                self.performance_tracker.generate_report()
+                last_report_time = current_time
                 
             time.sleep(1)
             
-        # Generate report
+        # Generate final report
         report = self.performance_tracker.generate_report()
         logger.info(f"Backtest completed. Report:\n{report}")
+        
+        # Stop the data engine to prevent further polling
+        self.data_engine.stop()
         
         # Restore original trading loop if we're not already stopped
         if hasattr(self, '_original_trading_loop'):
@@ -1052,32 +1359,98 @@ class AlpacaTradingSystem:
         self.backtest_current_date = start
         self.backtest_data_processed = False
         
+        # Track symbols with data
+        symbols_with_data = []
+        
         # Get historical data for each symbol
         for symbol in self.config.symbols:
             try:
-                # Get daily bars for the backtest period
-                bars = self.api.get_bars(
-                    symbol, 
-                    TimeFrame.Day, 
-                    start.strftime('%Y-%m-%d'),
-                    end.strftime('%Y-%m-%d'),
-                    adjustment='raw'
-                ).df
+                # Check if we should use local data
+                if self.config.use_local_data and self.config.local_data_dir:
+                    # Load data from local CSV file
+                    bars = self._load_data_from_csv(symbol, start, end)
+                else:
+                    # Get daily bars for the backtest period from Alpaca API
+                    bars = self.api.get_bars(
+                        symbol, 
+                        TimeFrame.Day, 
+                        start.strftime('%Y-%m-%d'),
+                        end.strftime('%Y-%m-%d'),
+                        adjustment='raw'
+                    ).df
                 
                 # Store in data engine
                 if not bars.empty:
                     self.data_engine.bars[symbol] = bars
                     logger.info(f"Loaded {len(bars)} bars for {symbol}")
+                    symbols_with_data.append(symbol)
                 else:
                     logger.warning(f"No data available for {symbol}")
                     
             except Exception as e:
                 logger.error(f"Error loading backtest data for {symbol}: {str(e)}")
+        
+        # Update the symbols list to only include those with data
+        if not symbols_with_data:
+            logger.error("No data available for any symbols. Cannot run backtest.")
+            return
+            
+        logger.info(f"Backtest will use data for {len(symbols_with_data)} symbols: {', '.join(symbols_with_data)}")
                 
         # Modify the _trading_loop method to process backtest data day by day
         self._original_trading_loop = self._trading_loop
         self._trading_loop = self._backtest_trading_loop
         
+    def _load_data_from_csv(self, symbol: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+        """Load historical data from a local CSV file"""
+        try:
+            # Construct the file path
+            file_path = os.path.join(self.config.local_data_dir, f"{symbol}_data.csv")
+            
+            if not os.path.exists(file_path):
+                logger.warning(f"CSV file not found for {symbol}: {file_path}")
+                return pd.DataFrame()
+                
+            # Read the CSV file
+            df = pd.read_csv(file_path)
+            
+            # Convert date column to datetime and set as index
+            df['Date'] = pd.to_datetime(df['Date'])
+            
+            # Make timestamps timezone-aware (use 'America/New_York' for market data)
+            df['Date'] = df['Date'].dt.tz_localize('America/New_York')
+            
+            df = df.set_index('Date')
+            
+            # Rename columns to match Alpaca API format
+            column_mapping = {
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Volume': 'volume'
+            }
+            df = df.rename(columns=column_mapping)
+            
+            # Filter by date range
+            # Make sure start_date and end_date are also timezone-aware
+            if start_date.tz is None:
+                start_date = start_date.tz_localize('America/New_York')
+            if end_date.tz is None:
+                end_date = end_date.tz_localize('America/New_York')
+                
+            df = df[(df.index >= start_date) & (df.index <= end_date)]
+            
+            # Sort by date
+            df = df.sort_index()
+            
+            logger.info(f"Loaded {len(df)} rows from CSV for {symbol}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading CSV data for {symbol}: {str(e)}")
+            return pd.DataFrame()
+
     def _backtest_trading_loop(self):
         """Trading loop for backtest mode"""
         logger.info("Trading loop started")
@@ -1102,7 +1475,9 @@ class AlpacaTradingSystem:
                         # Filter bars for the current date
                         day_data = pd.DataFrame()
                         for idx, row in bar_data.iterrows():
-                            if idx.strftime('%Y-%m-%d') == current_date_str:
+                            # Handle timezone-aware and timezone-naive timestamps
+                            idx_date_str = idx.strftime('%Y-%m-%d')
+                            if idx_date_str == current_date_str:
                                 # Use concat instead of append
                                 new_row = pd.DataFrame([row], index=[idx])
                                 day_data = pd.concat([day_data, new_row]) if not day_data.empty else new_row
@@ -1132,8 +1507,8 @@ class AlpacaTradingSystem:
                 # Update order status
                 self.execution_engine.update_orders()
                 
-                # Update performance metrics
-                self.performance_tracker.update_performance()
+                # Update performance metrics with the current backtest date
+                self.performance_tracker.update_performance(backtest_date=current_date)
                 
                 # Check for risk threshold breaches
                 if self.risk_manager.should_exit_all_positions():
