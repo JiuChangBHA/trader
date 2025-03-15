@@ -1,0 +1,15 @@
+{
+    "enabled": true,
+    "symbols": [
+        "AAPL",
+        "MSFT"
+    ],
+    "parameters": {
+        "timeperiod": 20,
+        "nbdevup": 2.0,
+        "nbdevdn": 2.0,
+        "matype": 0
+    },
+    "risk_multiplier": 1.0,
+    "trade_direction": "both"
+}

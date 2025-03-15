@@ -1,0 +1,14 @@
+{
+    "enabled": true,
+    "symbols": [
+        "AMZN",
+        "GOOGL"
+    ],
+    "parameters": {
+        "fast_period": 9,
+        "slow_period": 21,
+        "signal_period": 9
+    },
+    "risk_multiplier": 0.8,
+    "trade_direction": "long"
+}
