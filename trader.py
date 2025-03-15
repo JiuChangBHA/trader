@@ -82,7 +82,7 @@ class DataEngine:
     def start(self):
         """Start the data engine"""
         self.running = True
-        self.data_thread = threading.Thread(target=self._stream_data)
+        self.data_thread = threading.Thread(target=self._poll_data)
         self.data_thread.daemon = True
         self.data_thread.start()
         logger.info("Data Engine started")
@@ -93,57 +93,62 @@ class DataEngine:
         if self.data_thread:
             self.data_thread.join(timeout=5)
         logger.info("Data Engine stopped")
+    
+    def _poll_data(self):
+        """Poll data from Alpaca API instead of streaming to avoid connection limits"""
+        logger.info("Starting data polling")
         
-    def _stream_data(self):
-        """Stream data from Alpaca"""
-        stream = Stream(
-            key_id=self.api._key_id,
-            secret_key=self.api._secret_key,
-            base_url=self.api._base_url,
-            data_feed='iex'
-        )
-        
-        # Set up handlers
-        @stream.on_bar('*')
-        async def on_bar(bar):
-            symbol = bar.symbol
-            if symbol in self.symbols:
-                new_bar = pd.DataFrame({
-                    'timestamp': [bar.timestamp],
-                    'open': [bar.open],
-                    'high': [bar.high],
-                    'low': [bar.low],
-                    'close': [bar.close],
-                    'volume': [bar.volume]
-                })
-                self.bars[symbol] = pd.concat([self.bars[symbol], new_bar]).tail(1000)
-                self.data_queue.put(('BAR', symbol, bar))
-        
-        @stream.on_quote('*')
-        async def on_quote(quote):
-            symbol = quote.symbol
-            if symbol in self.symbols:
-                self.quotes[symbol] = quote
-                self.data_queue.put(('QUOTE', symbol, quote))
-        
-        @stream.on_trade('*')
-        async def on_trade(trade):
-            symbol = trade.symbol
-            if symbol in self.symbols:
-                self.trades[symbol] = trade
-                self.data_queue.put(('TRADE', symbol, trade))
-        
-        # Subscribe to data
-        for symbol in self.symbols:
-            stream.subscribe_bars(on_bar, symbol)
-            stream.subscribe_quotes(on_quote, symbol)
-            stream.subscribe_trades(on_trade, symbol)
-        
-        try:
-            stream.run()
-        except Exception as e:
-            logger.error(f"Stream error: {str(e)}")
-            self.running = False
+        while self.running:
+            try:
+                # Poll for latest bars for each symbol
+                for symbol in self.symbols:
+                    try:
+                        # Get the latest bar
+                        latest_bar = self.api.get_latest_bar(symbol)
+                        
+                        # Create a DataFrame with the new bar
+                        new_bar = pd.DataFrame({
+                            'timestamp': [pd.Timestamp(latest_bar.t)],
+                            'open': [latest_bar.o],
+                            'high': [latest_bar.h],
+                            'low': [latest_bar.l],
+                            'close': [latest_bar.c],
+                            'volume': [latest_bar.v]
+                        })
+                        new_bar.set_index('timestamp', inplace=True)
+                        
+                        # Update our bars dictionary
+                        if symbol in self.bars:
+                            # Only add if it's a new bar or we have no data yet
+                            if len(self.bars[symbol]) == 0:
+                                self.bars[symbol] = new_bar
+                                self.data_queue.put(('BAR', symbol, latest_bar))
+                            elif len(self.bars[symbol].index) > 0 and pd.Timestamp(latest_bar.t) > self.bars[symbol].index[-1]:
+                                self.bars[symbol] = pd.concat([self.bars[symbol], new_bar]).tail(1000)
+                                self.data_queue.put(('BAR', symbol, latest_bar))
+                        
+                        # Get latest quote
+                        latest_quote = self.api.get_latest_quote(symbol)
+                        self.quotes[symbol] = latest_quote
+                        self.data_queue.put(('QUOTE', symbol, latest_quote))
+                        
+                        # Get latest trade
+                        latest_trade = self.api.get_latest_trade(symbol)
+                        self.trades[symbol] = latest_trade
+                        self.data_queue.put(('TRADE', symbol, latest_trade))
+                        
+                        # Add a small delay between symbols to avoid rate limits
+                        time.sleep(0.5)
+                        
+                    except Exception as e:
+                        logger.error(f"Error polling data for {symbol}: {str(e)}")
+                
+                # Wait before polling again
+                time.sleep(5)  # Poll every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in data polling: {str(e)}")
+                time.sleep(10)  # Wait longer before retrying after an error
     
     def get_historical_data(self, symbol: str, timeframe: TimeFrame = TimeFrame.Day, 
                            limit: int = 100) -> pd.DataFrame:
