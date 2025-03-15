@@ -63,9 +63,23 @@ class Config:
             self.data_retention = self.config.get('data_retention_days', 30)
             self.backtest_mode = self.config.get('backtest_mode', False)
             
+            # Backtest settings
+            self.initial_equity = self.config.get('initial_equity', 100000.0)  # Default $100,000
+            
         except Exception as e:
             logger.error(f"Error loading configuration: {str(e)}")
             raise
+            
+    def set_backtest_mode(self, enabled: bool = True):
+        """Enable or disable backtest mode"""
+        self.backtest_mode = enabled
+        logger.info(f"Backtest mode {'enabled' if enabled else 'disabled'}")
+        
+    def set_backtest_dates(self, start_date: str, end_date: str):
+        """Set backtest date range"""
+        self.backtest_start_date = start_date
+        self.backtest_end_date = end_date
+        logger.info(f"Backtest date range set: {start_date} to {end_date}")
 
 # Data Engine: Handles market data ingestion and processing
 class DataEngine:
@@ -325,23 +339,49 @@ class RiskManager:
         self.max_position_size = config.risk_params.get('max_position_size', 0.05)  # 5% of portfolio per position
         self.max_drawdown = config.risk_params.get('max_drawdown', 0.10)  # 10% max drawdown
         self.max_open_positions = config.risk_params.get('max_open_positions', 10)
-        self.starting_equity = None
-        self.current_drawdown = 0.0
+        self.backtest_mode = config.backtest_mode
         self.positions = {}
+        
+        # Initialize equity values
+        self.starting_equity = config.initial_equity if hasattr(config, 'initial_equity') else 100000.0  # Use config value or default
+        self.current_equity = self.starting_equity
+        self.current_drawdown = 0.0
+        
+        # If not in backtest mode, try to get real account equity
+        if not self.backtest_mode:
+            try:
+                account = self.api.get_account()
+                self.starting_equity = float(account.equity)
+                self.current_equity = self.starting_equity
+            except Exception as e:
+                logger.warning(f"Could not get account equity, using default: {str(e)}")
+        
+        logger.info(f"Risk Manager initialized with equity: ${self.current_equity:.2f}")
         
     def update_account_info(self) -> None:
         """Update account equity information"""
         try:
+            if self.backtest_mode:
+                # In backtest mode, we use the simulated equity
+                # This would normally be updated by the backtest engine based on P&L
+                # Make sure we're using the starting equity value
+                if self.current_equity == 0:
+                    self.current_equity = self.starting_equity
+                
+                # No need to update anything, just log the current values
+                logger.info(f"Account equity: ${self.current_equity:.2f}, Drawdown: {self.current_drawdown:.2%}")
+                return
+                
+            # Live mode - get real account info
             account = self.api.get_account()
             current_equity = float(account.equity)
             
-            # Set starting equity if not set
-            if self.starting_equity is None:
-                self.starting_equity = current_equity
+            self.current_equity = current_equity
             
             # Calculate current drawdown
             peak_equity = max(self.starting_equity, current_equity)
-            self.current_drawdown = 1 - (current_equity / peak_equity)
+            if peak_equity > 0:  # Avoid division by zero
+                self.current_drawdown = 1 - (current_equity / peak_equity)
             
             logger.info(f"Account equity: ${current_equity:.2f}, Drawdown: {self.current_drawdown:.2%}")
         except Exception as e:
@@ -358,18 +398,33 @@ class RiskManager:
             return False
         
         # Check number of open positions
-        positions = self.api.list_positions()
-        if len(positions) >= self.max_open_positions:
-            logger.warning(f"Max open positions reached: {len(positions)} >= {self.max_open_positions}")
-            return False
+        try:
+            if self.backtest_mode:
+                # In backtest mode, use our internal position tracking
+                num_positions = len([p for p in self.positions.values() if p != 0])
+            else:
+                positions = self.api.list_positions()
+                num_positions = len(positions)
+                
+            if num_positions >= self.max_open_positions:
+                logger.warning(f"Max open positions reached: {num_positions} >= {self.max_open_positions}")
+                return False
+        except Exception as e:
+            logger.error(f"Error checking positions: {str(e)}")
+            # Continue with other checks
         
         return True
     
     def calculate_position_size(self, symbol: str, price: float, signal_strength: float = 1.0) -> int:
         """Calculate position size based on account equity and risk parameters"""
         try:
-            account = self.api.get_account()
-            equity = float(account.equity)
+            # Use the correct equity value
+            equity = self.current_equity
+            
+            # If equity is 0 or None, use the initial equity
+            if not equity or equity == 0:
+                equity = self.starting_equity
+                logger.warning(f"Using initial equity ${equity:.2f} for position sizing")
             
             # Calculate position value based on max position size
             max_position_value = equity * self.max_position_size
@@ -378,7 +433,10 @@ class RiskManager:
             adjusted_position_value = max_position_value * signal_strength
             
             # Calculate number of shares
-            shares = int(adjusted_position_value / price)
+            if price > 0:  # Avoid division by zero
+                shares = int(adjusted_position_value / price)
+            else:
+                shares = 0
             
             # Log the calculation
             logger.info(f"Position size for {symbol}: {shares} shares (${shares * price:.2f})")
@@ -391,6 +449,10 @@ class RiskManager:
     def get_current_position(self, symbol: str) -> int:
         """Get current position for a symbol"""
         try:
+            if self.backtest_mode:
+                # Use internal position tracking in backtest mode
+                return self.positions.get(symbol, 0)
+                
             position = self.api.get_position(symbol)
             return int(position.qty)
         except:
@@ -504,13 +566,15 @@ class ExecutionEngine:
 
 # Performance Tracker: Tracks and reports on system performance
 class PerformanceTracker:
-    def __init__(self, api: REST, db_path: str = "performance.db"):
+    def __init__(self, api: REST, db_path: str = "performance.db", backtest_mode: bool = False):
         self.api = api
         self.db_path = db_path
         self.start_time = datetime.now()
         self.trades = []
         self.daily_returns = []
         self.equity_curve = []
+        self.initial_equity = 100000.0  # Default initial equity for backtesting
+        self.backtest_mode = backtest_mode
         
         # Initialize tracking
         self.update_performance()
@@ -519,9 +583,23 @@ class PerformanceTracker:
         """Update performance metrics"""
         try:
             # Get account info
-            account = self.api.get_account()
-            equity = float(account.equity)
-            
+            try:
+                if self.backtest_mode:
+                    # In backtest mode, use the initial equity value
+                    equity = self.initial_equity
+                    logger.debug(f"Using initial equity for backtest: ${equity:.2f}")
+                else:
+                    # In live mode, get from API
+                    account = self.api.get_account()
+                    equity = float(account.equity)
+            except Exception as e:
+                # If API fails, use the last equity value or initial value
+                if self.equity_curve:
+                    equity = self.equity_curve[-1]['equity']
+                else:
+                    equity = self.initial_equity
+                logger.debug(f"Using fallback equity value: ${equity:.2f}")
+                    
             # Record equity point
             self.equity_curve.append({
                 'timestamp': datetime.now(),
@@ -531,27 +609,33 @@ class PerformanceTracker:
             # Calculate daily return if we have more than one data point
             if len(self.equity_curve) > 1:
                 prev_equity = self.equity_curve[-2]['equity']
-                daily_return = (equity - prev_equity) / prev_equity
-                self.daily_returns.append({
-                    'date': datetime.now().date(),
-                    'return': daily_return
-                })
+                if prev_equity > 0:  # Avoid division by zero
+                    daily_return = (equity - prev_equity) / prev_equity
+                    self.daily_returns.append({
+                        'date': datetime.now().date(),
+                        'return': daily_return
+                    })
             
             # Get closed positions (completed trades)
-            closed_orders = self.api.list_orders(status='closed', limit=100)
-            
-            # Process new trades
-            for order in closed_orders:
-                if order.filled_at and order.id not in [t['order_id'] for t in self.trades]:
-                    self.trades.append({
-                        'order_id': order.id,
-                        'symbol': order.symbol,
-                        'side': order.side,
-                        'qty': int(order.qty),
-                        'filled_price': float(order.filled_avg_price),
-                        'filled_at': order.filled_at,
-                        'profit_loss': None  # Will calculate later when we have both sides
-                    })
+            try:
+                if not self.backtest_mode:
+                    closed_orders = self.api.list_orders(status='closed', limit=100)
+                    
+                    # Process new trades
+                    for order in closed_orders:
+                        if order.filled_at and order.id not in [t['order_id'] for t in self.trades]:
+                            self.trades.append({
+                                'order_id': order.id,
+                                'symbol': order.symbol,
+                                'side': order.side,
+                                'qty': int(order.qty),
+                                'filled_price': float(order.filled_avg_price),
+                                'filled_at': order.filled_at,
+                                'profit_loss': None  # Will calculate later when we have both sides
+                            })
+            except Exception as e:
+                # In backtest mode or if API fails, we might not have access to orders
+                logger.debug(f"Could not retrieve orders: {str(e)}")
         
         except Exception as e:
             logger.error(f"Error updating performance metrics: {str(e)}")
@@ -565,7 +649,11 @@ class PerformanceTracker:
             # Calculate returns
             starting_equity = self.equity_curve[0]['equity']
             ending_equity = self.equity_curve[-1]['equity']
-            total_return = (ending_equity - starting_equity) / starting_equity
+            
+            if starting_equity > 0:  # Avoid division by zero
+                total_return = (ending_equity - starting_equity) / starting_equity
+            else:
+                total_return = 0
             
             # Calculate Sharpe ratio if we have daily returns
             sharpe_ratio = None
@@ -573,8 +661,10 @@ class PerformanceTracker:
                 returns = [r['return'] for r in self.daily_returns]
                 avg_return = np.mean(returns)
                 std_return = np.std(returns)
-                if std_return > 0:
+                if std_return > 0:  # Avoid division by zero
                     sharpe_ratio = (avg_return / std_return) * np.sqrt(252)  # Annualized
+                else:
+                    sharpe_ratio = 0
             
             # Calculate max drawdown
             peak = 0
@@ -582,8 +672,9 @@ class PerformanceTracker:
             for point in self.equity_curve:
                 if point['equity'] > peak:
                     peak = point['equity']
-                drawdown = (peak - point['equity']) / peak
-                max_drawdown = max(max_drawdown, drawdown)
+                if peak > 0:  # Avoid division by zero
+                    drawdown = (peak - point['equity']) / peak
+                    max_drawdown = max(max_drawdown, drawdown)
                 
             # Calculate win rate
             win_count = sum(1 for trade in self.trades if trade['profit_loss'] and trade['profit_loss'] > 0)
@@ -612,11 +703,37 @@ class PerformanceTracker:
         
         # Add performance metrics
         report += "Performance Metrics:\n"
-        report += f"- Total Return: {metrics.get('total_return', 'N/A'):.2%}\n"
-        report += f"- Sharpe Ratio: {metrics.get('sharpe_ratio', 'N/A'):.2f}\n"
-        report += f"- Max Drawdown: {metrics.get('max_drawdown', 'N/A'):.2%}\n"
-        report += f"- Win Rate: {metrics.get('win_rate', 'N/A'):.2%}\n"
-        report += f"- Total Trades: {metrics.get('total_trades', 'N/A')}\n"
+        
+        # Format metrics with proper handling of None values
+        total_return = metrics.get('total_return')
+        if total_return is not None:
+            report += f"- Total Return: {total_return:.2%}\n"
+        else:
+            report += f"- Total Return: N/A\n"
+            
+        sharpe_ratio = metrics.get('sharpe_ratio')
+        if sharpe_ratio is not None:
+            report += f"- Sharpe Ratio: {sharpe_ratio:.2f}\n"
+        else:
+            report += f"- Sharpe Ratio: N/A\n"
+            
+        max_drawdown = metrics.get('max_drawdown')
+        if max_drawdown is not None:
+            report += f"- Max Drawdown: {max_drawdown:.2%}\n"
+        else:
+            report += f"- Max Drawdown: N/A\n"
+            
+        win_rate = metrics.get('win_rate')
+        if win_rate is not None:
+            report += f"- Win Rate: {win_rate:.2%}\n"
+        else:
+            report += f"- Win Rate: N/A\n"
+            
+        total_trades = metrics.get('total_trades')
+        if total_trades is not None:
+            report += f"- Total Trades: {total_trades}\n"
+        else:
+            report += f"- Total Trades: N/A\n"
         
         return report
 
@@ -768,11 +885,15 @@ class AlpacaTradingSystem:
             self.api, self.config, self.data_engine, 
             self.risk_manager, self.execution_engine
         )
-        self.performance_tracker = PerformanceTracker(self.api)
+        
+        # Initialize performance tracker with correct initial equity
+        self.performance_tracker = PerformanceTracker(self.api, backtest_mode=self.config.backtest_mode)
+        self.performance_tracker.initial_equity = self.config.initial_equity if hasattr(self.config, 'initial_equity') else 100000.0
         
         # System state
         self.running = False
         self.main_thread = None
+        self.start_time = None
         
     def start(self):
         """Start the trading system"""
@@ -781,6 +902,7 @@ class AlpacaTradingSystem:
             return
         
         logger.info("Starting Alpaca Trading System")
+        self.start_time = datetime.now()
         
         # Start data engine
         self.data_engine.start()
@@ -815,6 +937,70 @@ class AlpacaTradingSystem:
         self.execution_engine.cancel_all_orders()
         
         logger.info("Trading system stopped successfully")
+        
+    def run_backtest(self, start_date: str, end_date: str):
+        """Run system in backtest mode"""
+        if self.running:
+            logger.warning("Cannot start backtest while system is running")
+            return
+            
+        logger.info(f"Starting backtest from {start_date} to {end_date}")
+        
+        # Enable backtest mode
+        self.config.set_backtest_mode(True)
+        self.config.set_backtest_dates(start_date, end_date)
+        
+        # Set initial equity for backtesting
+        initial_equity = self.config.initial_equity if hasattr(self.config, 'initial_equity') else 100000.0
+        
+        # Reinitialize the risk manager with backtest mode enabled
+        self.risk_manager = RiskManager(self.api, self.config)
+        self.risk_manager.starting_equity = initial_equity
+        self.risk_manager.current_equity = initial_equity
+        
+        # Reinitialize the performance tracker with backtest mode enabled
+        self.performance_tracker = PerformanceTracker(self.api, backtest_mode=True)
+        self.performance_tracker.initial_equity = initial_equity
+        
+        # Force update the equity curve with the initial equity
+        self.performance_tracker.equity_curve = []
+        self.performance_tracker.update_performance()
+        
+        logger.info(f"Backtest initial equity: ${initial_equity:.2f}")
+        
+        # Setup backtest data
+        self._setup_backtest(start_date, end_date)
+        
+        # Run backtest
+        self.start()
+        
+        # Wait for completion
+        max_wait_time = 300  # Maximum wait time in seconds (5 minutes)
+        start_wait_time = time.time()
+        
+        while self.running:
+            # Check if we've exceeded the maximum wait time
+            if time.time() - start_wait_time > max_wait_time:
+                logger.warning("Backtest exceeded maximum wait time, stopping")
+                self.stop()
+                break
+                
+            # Check if backtest is complete
+            if hasattr(self, 'backtest_data_processed') and self.backtest_data_processed:
+                logger.info("Backtest data processing complete")
+                break
+                
+            time.sleep(1)
+            
+        # Generate report
+        report = self.performance_tracker.generate_report()
+        logger.info(f"Backtest completed. Report:\n{report}")
+        
+        # Restore original trading loop if we're not already stopped
+        if hasattr(self, '_original_trading_loop'):
+            self._trading_loop = self._original_trading_loop
+        
+        return report
         
     def _trading_loop(self):
         """Main trading loop"""
@@ -853,33 +1039,6 @@ class AlpacaTradingSystem:
                 
         logger.info("Trading loop ended")
         
-    def run_backtest(self, start_date: str, end_date: str):
-        """Run system in backtest mode"""
-        if self.running:
-            logger.warning("Cannot start backtest while system is running")
-            return
-            
-        logger.info(f"Starting backtest from {start_date} to {end_date}")
-        
-        # Enable backtest mode
-        self.config.backtest_mode = True
-        
-        # Setup backtest data
-        self._setup_backtest(start_date, end_date)
-        
-        # Run backtest
-        self.start()
-        
-        # Wait for completion
-        while self.running:
-            time.sleep(1)
-            
-        # Generate report
-        report = self.performance_tracker.generate_report()
-        logger.info(f"Backtest completed. Report:\n{report}")
-        
-        return report
-        
     def _setup_backtest(self, start_date: str, end_date: str):
         """Setup data for backtesting"""
         logger.info("Loading historical data for backtest")
@@ -887,6 +1046,11 @@ class AlpacaTradingSystem:
         # Convert dates to datetime objects
         start = pd.to_datetime(start_date)
         end = pd.to_datetime(end_date)
+        
+        # Store backtest end date for checking completion
+        self.backtest_end_date = end
+        self.backtest_current_date = start
+        self.backtest_data_processed = False
         
         # Get historical data for each symbol
         for symbol in self.config.symbols:
@@ -909,6 +1073,89 @@ class AlpacaTradingSystem:
                     
             except Exception as e:
                 logger.error(f"Error loading backtest data for {symbol}: {str(e)}")
+                
+        # Modify the _trading_loop method to process backtest data day by day
+        self._original_trading_loop = self._trading_loop
+        self._trading_loop = self._backtest_trading_loop
+        
+    def _backtest_trading_loop(self):
+        """Trading loop for backtest mode"""
+        logger.info("Trading loop started")
+        
+        # Process each day in the backtest period
+        current_date = self.backtest_current_date
+        end_date = self.backtest_end_date
+        
+        while self.running and current_date <= end_date:
+            try:
+                logger.info(f"Processing backtest data for {current_date.strftime('%Y-%m-%d')}")
+                
+                # Process data for current date
+                for symbol in self.config.symbols:
+                    if symbol in self.data_engine.bars:
+                        # Get data for current date
+                        bar_data = self.data_engine.bars[symbol]
+                        
+                        # Convert current_date to string for comparison
+                        current_date_str = current_date.strftime('%Y-%m-%d')
+                        
+                        # Filter bars for the current date
+                        day_data = pd.DataFrame()
+                        for idx, row in bar_data.iterrows():
+                            if idx.strftime('%Y-%m-%d') == current_date_str:
+                                # Use concat instead of append
+                                new_row = pd.DataFrame([row], index=[idx])
+                                day_data = pd.concat([day_data, new_row]) if not day_data.empty else new_row
+                        
+                        if not day_data.empty:
+                            # Process each bar for this day
+                            for idx, bar in day_data.iterrows():
+                                # Create a bar object similar to what would come from the API
+                                bar_obj = type('obj', (object,), {
+                                    't': idx,
+                                    'o': bar['open'],
+                                    'h': bar['high'],
+                                    'l': bar['low'],
+                                    'c': bar['close'],
+                                    'v': bar['volume'],
+                                    'symbol': symbol
+                                })
+                                
+                                # Add to data queue
+                                self.data_engine.data_queue.put(('BAR', symbol, bar_obj))
+                
+                # Process data from queue
+                while not self.data_engine.data_queue.empty():
+                    data_type, symbol, data = self.data_engine.data_queue.get()
+                    self.strategy_manager.process_market_data(data_type, symbol, data)
+                
+                # Update order status
+                self.execution_engine.update_orders()
+                
+                # Update performance metrics
+                self.performance_tracker.update_performance()
+                
+                # Check for risk threshold breaches
+                if self.risk_manager.should_exit_all_positions():
+                    logger.warning("Risk thresholds exceeded - exiting all positions")
+                    # TODO: Implement exit all positions function
+                
+                # Move to next day
+                current_date += timedelta(days=1)
+                self.backtest_current_date = current_date
+                
+                # Sleep briefly to avoid high CPU usage
+                time.sleep(0.01)
+                
+            except Exception as e:
+                logger.error(f"Error in backtest trading loop: {str(e)}")
+                self.running = False
+        
+        # Backtest complete
+        logger.info("Backtest complete - all historical data processed")
+        self.backtest_data_processed = True
+        self.running = False
+        logger.info("Trading loop ended")
 
 class MarketHealthMonitor:
     """Monitors overall market health to adjust trading behavior"""

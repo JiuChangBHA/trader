@@ -437,7 +437,260 @@ class TradingDashboard:
             
             return fig
         
-        # System logs
+# System logs
         @self.app.callback(
             Output("log-display", "children"),
-            [Input("log-level-selector
+            [Input("log-level-selector", "value"), Input("system-status", "children")]
+        )
+        def update_logs(log_level, status):
+            # Get logs based on selected level
+            logs = self._get_logs(log_level)
+            
+            # Format logs as HTML
+            log_entries = []
+            for log in logs:
+                log_class = "log-info"
+                if log.get("level") == "WARNING":
+                    log_class = "log-warning"
+                elif log.get("level") == "ERROR":
+                    log_class = "log-error"
+                
+                log_entries.append(
+                    html.Div(
+                        f"[{log.get('timestamp')}] {log.get('level')}: {log.get('message')}",
+                        className=log_class
+                    )
+                )
+            
+            return log_entries
+    
+    def _get_equity_data(self):
+        """Get equity data for charting"""
+        try:
+            # Get account history from trading system
+            if hasattr(self.trading_system, 'performance_tracker'):
+                equity_history = self.trading_system.performance_tracker.get_equity_history()
+                return equity_history
+            else:
+                # Return dummy data for development
+                dates = [datetime.now() - timedelta(days=i) for i in range(30, 0, -1)]
+                equity = [100000 * (1 + 0.0003 * i + 0.001 * np.random.randn()) for i in range(30)]
+                return pd.DataFrame({'timestamp': dates, 'equity': equity})
+        except Exception as e:
+            print(f"Error getting equity data: {e}")
+            return pd.DataFrame({'timestamp': [datetime.now()], 'equity': [0]})
+    
+    def _get_portfolio_stats_html(self):
+        """Get portfolio statistics as HTML"""
+        try:
+            if hasattr(self.trading_system, 'performance_tracker'):
+                stats = self.trading_system.performance_tracker.get_portfolio_stats()
+            else:
+                # Dummy stats for development
+                stats = {
+                    'total_return': 8.45,
+                    'daily_return': 0.34,
+                    'monthly_return': 2.67,
+                    'annual_return': 12.54,
+                    'sharpe_ratio': 1.23,
+                    'sortino_ratio': 1.47,
+                    'win_rate': 58.3
+                }
+            
+            return html.Div([
+                html.P(f"Total Return: {stats.get('total_return', 0):.2f}%"),
+                html.P(f"Daily Return: {stats.get('daily_return', 0):.2f}%"),
+                html.P(f"Monthly Return: {stats.get('monthly_return', 0):.2f}%"),
+                html.P(f"Annual Return: {stats.get('annual_return', 0):.2f}%"),
+                html.P(f"Sharpe Ratio: {stats.get('sharpe_ratio', 0):.2f}"),
+                html.P(f"Win Rate: {stats.get('win_rate', 0):.1f}%")
+            ])
+        except Exception as e:
+            print(f"Error getting portfolio stats: {e}")
+            return html.Div("No data available")
+    
+    def _get_risk_metrics_html(self):
+        """Get risk metrics as HTML"""
+        try:
+            if hasattr(self.trading_system, 'risk_manager'):
+                metrics = self.trading_system.risk_manager.get_risk_metrics()
+            else:
+                # Dummy metrics for development
+                metrics = {
+                    'max_drawdown': -4.21,
+                    'volatility': 5.67,
+                    'var_95': -1.23,
+                    'expected_shortfall': -1.78,
+                    'beta': 0.85,
+                    'correlation_spy': 0.68
+                }
+            
+            return html.Div([
+                html.P(f"Max Drawdown: {metrics.get('max_drawdown', 0):.2f}%"),
+                html.P(f"Volatility: {metrics.get('volatility', 0):.2f}%"),
+                html.P(f"VaR (95%): {metrics.get('var_95', 0):.2f}%"),
+                html.P(f"Expected Shortfall: {metrics.get('expected_shortfall', 0):.2f}%"),
+                html.P(f"Beta: {metrics.get('beta', 0):.2f}"),
+                html.P(f"Market Correlation: {metrics.get('correlation_spy', 0):.2f}")
+            ])
+        except Exception as e:
+            print(f"Error getting risk metrics: {e}")
+            return html.Div("No data available")
+    
+    def _get_positions_data(self):
+        """Get positions data for table"""
+        try:
+            if hasattr(self.trading_system, 'execution_engine'):
+                positions = self.trading_system.execution_engine.get_positions()
+                return positions
+            else:
+                # Dummy positions for development
+                return [
+                    {"symbol": "AAPL", "qty": 100, "avg_entry_price": 150.23, "current_price": 152.45, 
+                     "unrealized_pl": 222.00, "unrealized_plpc": 1.48},
+                    {"symbol": "MSFT", "qty": 50, "avg_entry_price": 290.45, "current_price": 294.32, 
+                     "unrealized_pl": 193.50, "unrealized_plpc": 1.33},
+                    {"symbol": "AMZN", "qty": 20, "avg_entry_price": 3200.10, "current_price": 3180.20, 
+                     "unrealized_pl": -398.00, "unrealized_plpc": -0.62}
+                ]
+        except Exception as e:
+            print(f"Error getting positions: {e}")
+            return []
+    
+    def _get_orders_data(self):
+        """Get orders data for table"""
+        try:
+            if hasattr(self.trading_system, 'execution_engine'):
+                orders = self.trading_system.execution_engine.get_recent_orders()
+                return orders
+            else:
+                # Dummy orders for development
+                return [
+                    {"symbol": "AAPL", "side": "buy", "qty": 100, "type": "market", 
+                     "status": "filled", "created_at": "2023-04-05 09:31:24"},
+                    {"symbol": "MSFT", "side": "buy", "qty": 50, "type": "limit", 
+                     "status": "filled", "created_at": "2023-04-05 09:32:45"},
+                    {"symbol": "GOOGL", "side": "sell", "qty": 30, "type": "market", 
+                     "status": "filled", "created_at": "2023-04-05 14:22:18"},
+                    {"symbol": "TSLA", "side": "buy", "qty": 20, "type": "limit", 
+                     "status": "new", "created_at": "2023-04-05 15:01:32"}
+                ]
+        except Exception as e:
+            print(f"Error getting orders: {e}")
+            return []
+    
+    def _get_symbol_price_data(self, symbol):
+        """Get price data for a specific symbol"""
+        try:
+            if hasattr(self.trading_system, 'data_engine'):
+                data = self.trading_system.data_engine.get_market_data(symbol)
+                return data
+            else:
+                # Dummy data for development
+                n_points = 100
+                timestamps = [datetime.now() - timedelta(minutes=i) for i in range(n_points, 0, -1)]
+                base_price = 100.0
+                
+                # Generate random price movements
+                np.random.seed(42)  # For reproducibility
+                price_changes = np.cumsum(np.random.normal(0, 0.1, n_points))
+                prices = base_price + price_changes
+                
+                # Generate OHLC data
+                data = pd.DataFrame({
+                    'timestamp': timestamps,
+                    'open': prices + np.random.normal(0, 0.05, n_points),
+                    'high': prices + np.abs(np.random.normal(0, 0.1, n_points)),
+                    'low': prices - np.abs(np.random.normal(0, 0.1, n_points)),
+                    'close': prices,
+                    'volume': np.random.randint(1000, 10000, n_points)
+                })
+                return data
+        except Exception as e:
+            print(f"Error getting price data for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def _calculate_rsi(self, prices, window=14):
+        """Calculate RSI technical indicator"""
+        # Calculate price changes
+        delta = prices.diff()
+        
+        # Separate gains and losses
+        gains = delta.copy()
+        losses = delta.copy()
+        gains[gains < 0] = 0
+        losses[losses > 0] = 0
+        losses = -losses
+        
+        # Calculate average gains and losses
+        avg_gain = gains.rolling(window=window).mean()
+        avg_loss = losses.rolling(window=window).mean()
+        
+        # Calculate RS and RSI
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+    
+    def _get_logs(self, level="all"):
+        """Get system logs filtered by level"""
+        try:
+            if hasattr(self.trading_system, 'logger'):
+                logs = self.trading_system.get_logs(level)
+                return logs
+            else:
+                # Dummy logs for development
+                log_types = ["INFO", "WARNING", "ERROR"]
+                log_msgs = [
+                    "System initialized",
+                    f"Connected to Alpaca API ({self.trading_system.config.trading_mode} mode)",
+                    "Loading historical data for AAPL",
+                    "Loading historical data for MSFT",
+                    "Strategy BollingerBands initialized for AAPL",
+                    "WARNING: Unable to load full history for AMZN",
+                    "Signal generated: Buy AAPL (BollingerBands)",
+                    "Order placed: Buy 100 AAPL @ market",
+                    "Order filled: Buy 100 AAPL @ $152.45",
+                    "ERROR: Failed to connect to data stream, retrying...",
+                    "Reconnected to data stream"
+                ]
+                
+                # Create dummy logs with timestamps
+                logs = []
+                for i in range(20):
+                    log_time = datetime.now() - timedelta(minutes=i*5)
+                    log_level = np.random.choice(log_types, p=[0.7, 0.2, 0.1])
+                    log_msg = np.random.choice(log_msgs)
+                    
+                    # Filter by selected level
+                    if level != "all" and log_level.lower() != level.lower():
+                        continue
+                        
+                    logs.append({
+                        "timestamp": log_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "level": log_level,
+                        "message": log_msg
+                    })
+                
+                return logs
+        except Exception as e:
+            print(f"Error getting logs: {e}")
+            return []
+    
+    def run(self, debug=False, host="localhost", port=8050):
+        """Run the dashboard server"""
+        self.app.run_server(debug=debug, host=host, port=port)
+    
+    def start_thread(self, host="localhost", port=8050):
+        """Start the dashboard in a separate thread"""
+        if self.thread is None or not self.thread.is_alive():
+            self.running = True
+            self.thread = threading.Thread(target=self.run, kwargs={"debug": False, "host": host, "port": port})
+            self.thread.daemon = True
+            self.thread.start()
+    
+    def stop(self):
+        """Stop the dashboard thread"""
+        self.running = False
+        # Note: Currently Dash doesn't support clean shutdown from another thread
+        # This will need to be enhanced
